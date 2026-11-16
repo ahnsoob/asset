@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from statistics import mean
 
 from .extract import CompanyData
+from .issues import DataIssue, sort_issues
 
 KOREA_TOP_TAX_RATE = 0.264   # 법인세 최고세율 24% + 지방소득세 10%
 
@@ -55,11 +56,13 @@ class Assumptions:
     shares_outstanding: float | None = None  # None 이면 공시(주식총수 현황)에서
     mid_year: bool = True
     history_window: int = 3                  # 비율 평균을 낼 최근 연도 수
+    # 사용자가 직접 지정한 필드 이름. None = 알 수 없음 (시장 데이터 기본값 경고를 생략)
+    provided: frozenset[str] | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Assumptions":
-        known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
-        return cls(**known)
+        known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__ and k != "provided"}
+        return cls(**known, provided=frozenset(k for k, v in known.items() if v is not None))
 
 
 @dataclass
@@ -89,6 +92,7 @@ class ResolvedAssumptions:
     # 항목 → 산출 근거. "history": 과거 실적에서 그대로 산출(Excel 에서 수식으로 연결),
     # "market"/"book": 자본구조 가중치 기준. 없으면 직접 입력·기본값·제한(clip) 적용값.
     derived: dict[str, str] = field(default_factory=dict)
+    issues: list[DataIssue] = field(default_factory=list)
 
 
 @dataclass
@@ -112,6 +116,11 @@ class DCFResult:
     sensitivity: dict = field(default_factory=dict)
 
     @property
+    def issues(self) -> list[DataIssue]:
+        """데이터 점검 항목 (가정 → 기본값 → 조정 → 보완 → 0 처리 순)"""
+        return sort_issues(self.company.issues + self.a.issues)
+
+    @property
     def upside(self) -> float | None:
         if not self.share_price:
             return None
@@ -122,6 +131,10 @@ class DCFResult:
 def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumptions:
     n = a.projection_years
     notes: list[str] = []
+    issues: list[DataIssue] = []
+
+    def issue(kind, item, value, reason, *targets):
+        issues.append(DataIssue(kind, item, value, reason, list(targets)))
     hist = [y for y in data.years if y.revenue]
     if not hist:
         raise ValueError("매출액이 있는 연도가 없습니다. (금융업 등은 FCFF DCF 에 적합하지 않을 수 있음)")
@@ -132,14 +145,23 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
     linkable = len(hist) == len(data.years)
 
     def avg_ratio(fn, label, default, lo, hi, key):
-        vals = [fn(y) for y in recent]
-        vals = [v for v in vals if v is not None]
+        pairs = [(y.year, fn(y)) for y in recent]
+        vals = [v for _, v in pairs if v is not None]
         if not vals:
             notes.append(f"{label}: 공시 데이터 부족 → 기본값 {default:.1%}")
+            issue("assumed", label, f"{default:.1%} (전 기간)",
+                  f"최근 {len(recent)}년 공시에서 산출 불가 → 기본값", f"driver:{key}")
             return default
         m = mean(vals)
         if linkable and lo <= m <= hi and len(vals) == len(recent):
             derived[key] = "history"
+        if len(vals) < len(recent):
+            miss = ", ".join(str(yr) for yr, v in pairs if v is None)
+            issue("adjusted", label, f"{_clip(m, lo, hi):.1%}",
+                  f"{miss}년 데이터 없음 → 나머지 {len(vals)}개 연도 평균", f"driver:{key}")
+        if not lo <= m <= hi:
+            issue("adjusted", label, f"{_clip(m, lo, hi):.1%}",
+                  f"평균 {m:.1%} 가 허용 범위({lo:.0%}~{hi:.0%}) 밖 → 제한", f"driver:{key}")
         return _clip(m, lo, hi)
 
     # 매출 성장률: 과거 CAGR 에서 영구성장률로 선형 수렴
@@ -152,9 +174,13 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
         else:
             cagr = a.terminal_growth
             notes.append("매출 CAGR 계산 불가 → 영구성장률 사용")
+            issue("assumed", "매출 성장률", f"{cagr:.1%} (영구성장률)",
+                  "과거 매출이 1개 연도뿐이거나 음수라 CAGR 계산 불가", "driver:revenue_growth")
         g0 = _clip(cagr, -0.10, 0.30)
         if g0 != cagr:
             notes.append(f"과거 매출 CAGR {cagr:.1%} → {g0:.1%} 로 제한")
+            issue("adjusted", "매출 성장률 (1년차)", f"{g0:.1%}",
+                  f"과거 매출 CAGR {cagr:.1%} 가 −10%~30% 범위 밖 → 제한", "driver:revenue_growth")
         elif span > 0 and linkable:
             derived["revenue_growth"] = "history"
         gT = a.terminal_growth
@@ -173,9 +199,16 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
             da = [_clip(mean(da_vals), 0.0, 0.6)] * n
             if linkable and len(da_vals) == len(recent) and 0.0 <= mean(da_vals) <= 0.6:
                 derived["da_pct"] = "history"
+            if len(da_vals) < len(recent):
+                miss = ", ".join(str(y.year) for y in recent if y.da is None)
+                issue("adjusted", "D&A / 매출", f"{da[0]:.1%}",
+                      f"{miss}년 감가상각비 없음 → 나머지 {len(da_vals)}개 연도 평균", "driver:da_pct")
         else:
             da = list(capex)
             notes.append("감가상각비를 찾지 못해 D&A = CAPEX 로 가정")
+            issue("assumed", "D&A / 매출", f"= CAPEX/매출 {capex[0]:.1%}" + (" (연도별 CAPEX 와 동일)" if len(set(capex)) > 1 else ""),
+                  "현금흐름표·주석 어디서도 감가상각비를 찾지 못함 → D&A = CAPEX (순투자 0) 가정. "
+                  "--da 로 직접 지정 권장", "driver:da_pct")
     nwc = _per_year(a.nwc_pct_revenue, n) or [avg_ratio(
         lambda y: y.nwc / y.revenue if y.nwc is not None else None,
         "순운전자본/매출", 0.10, -0.5, 1.0, "nwc_pct")] * n
@@ -191,6 +224,9 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
         else:
             tax = KOREA_TOP_TAX_RATE
             notes.append(f"유효세율 산출 불가/이상치 → 법정 최고세율 {tax:.1%} 사용")
+            why = (f"최근 평균 유효세율 {mean(rates):.1%} 가 5%~40% 밖" if rates
+                   else "법인세비용 또는 세전이익(양수)을 찾지 못함")
+            issue("assumed", "법인세율", f"{tax:.1%} (법정 최고세율)", why + " → 법정세율", "assump:tax_rate")
 
     # 주식수
     shares = a.shares_outstanding or data.shares
@@ -212,6 +248,8 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
         if kd is None:
             kd = a.risk_free_rate + 0.015
             notes.append(f"이자비용/차입금으로 타인자본비용 산출 불가 → 무위험이자율+1.5% = {kd:.2%}")
+            issue("assumed", "세전 타인자본비용 (Kd)", f"{kd:.2%} (Rf + 1.5%)",
+                  "이자의 지급 또는 평균 차입금이 없어 산출 불가", "assump:kd")
 
     debt = last.total_debt
     if a.target_debt_weight is not None:
@@ -225,8 +263,20 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
             equity_mv = last.get("owners_equity") or last.get("total_equity") or 0.0
             basis = "장부가 자본"
             derived["debt_weight"] = "book"
+            if a.wacc_override is None:
+                issue("default", "부채 비중 D/(D+E)",
+                      f"{(debt / (debt + equity_mv) if debt + equity_mv > 0 else 0):.1%} (장부가 기준)",
+                      "주가(--price)·목표 자본구조(--debt-weight) 미입력 → 장부가 자본으로 가중", "assump:wd")
         wd = debt / (debt + equity_mv) if (debt + equity_mv) > 0 else 0.0
         notes.append(f"자본구조 가중치: {basis} 기준 D/(D+E) = {wd:.1%}")
+    if a.provided is not None and a.wacc_override is None:
+        market = [("risk_free_rate", "무위험이자율 (Rf)", "rf", f"{a.risk_free_rate:.2%}"),
+                  ("equity_risk_premium", "시장위험프리미엄 (ERP)", "erp", f"{a.equity_risk_premium:.2%}"),
+                  ("beta", "베타 (β)", "beta", f"{a.beta:.2f}")]
+        for fld, label, name, shown in market:
+            if fld not in a.provided:
+                issue("default", label, shown, "공시에 없는 시장 데이터 — 입력하지 않아 기본값 사용",
+                      f"assump:{name}")
     wacc = a.wacc_override if a.wacc_override is not None else (1 - wd) * ke + wd * kd * (1 - tax)
     if wacc <= a.terminal_growth and a.exit_ev_ebitda is None:
         raise ValueError(f"WACC({wacc:.2%}) 가 영구성장률({a.terminal_growth:.2%}) 이하입니다.")
@@ -240,7 +290,7 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
         size_premium=a.size_premium, cost_of_equity=ke, pre_tax_cost_of_debt=kd, debt_weight=wd,
         wacc=wacc, wacc_override=a.wacc_override,
         shares=shares, mid_year=a.mid_year, history_window=a.history_window, notes=notes,
-        derived=derived,
+        derived=derived, issues=issues,
     )
 
 

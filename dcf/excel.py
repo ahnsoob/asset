@@ -21,11 +21,13 @@ import tempfile
 from pathlib import Path
 
 from openpyxl import Workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter as C
 from openpyxl.workbook.defined_name import DefinedName
 
 from .accounts import SPECS
+from .issues import KINDS, needs_attention
 from .model import DCFResult
 
 UNIT = 1_000_000  # 백만원
@@ -40,6 +42,12 @@ HEAD_FILL = PatternFill("solid", fgColor="DDE5F0")
 SECTION_FILL = PatternFill("solid", fgColor="EEF2F7")
 KEY_FILL = PatternFill("solid", fgColor="FFF2CC")
 RAW_FILL = PatternFill("solid", fgColor="F7F7F7")
+ISSUE_FILL = {"assumed": PatternFill("solid", fgColor="F8CBAD"),    # 가정: 주황
+              "default": PatternFill("solid", fgColor="FCE4D6"),    # 기본값: 연주황
+              "adjusted": PatternFill("solid", fgColor="FFE699"),   # 조정: 노랑
+              "filled": PatternFill("solid", fgColor="C6EFCE"),     # 보완: 연두
+              "zero": PatternFill("solid", fgColor="EDEDED")}       # 0 처리: 회색
+WARN = Font(bold=True, color="C00000")
 THIN = Border(top=Side(style="thin"))
 DOUBLE = Border(top=Side(style="thin"), bottom=Side(style="double"))
 
@@ -63,11 +71,13 @@ def _section(ws, row, text, width):
 def export_excel(res: DCFResult, path: str, recalc: bool = True) -> None:
     wb = Workbook()
     hist = _build_historical(wb, res)
-    _build_assumptions(wb, res, hist)
+    assump = _build_assumptions(wb, res, hist)
     dcf = _build_dcf(wb, res, hist)
     _build_sensitivity(wb, res, dcf)
     _build_sources(wb, res)
     _build_summary(wb, res, dcf)
+    locations = _highlight_issues(wb, res, hist, assump, dcf)
+    _build_check(wb, res, locations)
     wb.active = 0
     wb.calculation.fullCalcOnLoad = True    # Excel 에서 열 때 전체 재계산
     wb.save(path)
@@ -230,7 +240,8 @@ def _build_historical(wb, res: DCFResult) -> dict:
         ws.column_dimensions[C(col)].width = 13
     ws.column_dimensions[C(avgc + 1)].width = 60
     ws.freeze_panes = "B4"
-    return {"sheet": ws.title, "rows": rows, "last": L, "avg": AV}
+    return {"sheet": ws.title, "rows": rows, "last": L, "avg": AV,
+            "year_col": {y.year: first + j for j, y in enumerate(years)}}
 
 
 # ====================================================================== Assumptions
@@ -288,6 +299,7 @@ def _build_assumptions(wb, res: DCFResult, hist: dict):
             ("price", "현재 주가 (원)", res.share_price or 0, "input", NUM, "0 이면 상승여력 미표시"),
         ]),
     ]
+    cells: dict[str, str] = {}
     r = 3
     for title, items in sections:
         r += 1
@@ -303,6 +315,7 @@ def _build_assumptions(wb, res: DCFResult, hist: dict):
                 ws.cell(r, 1).font = BOLD
             ws.cell(r, 3, note).font = NOTE
             _name(wb, name, ws.title, f"B{r}")
+            cells[name] = f"B{r}"
         r += 1
     notes = a.notes + d.warnings
     if notes:
@@ -314,6 +327,7 @@ def _build_assumptions(wb, res: DCFResult, hist: dict):
     ws.column_dimensions["A"].width = 34
     ws.column_dimensions["B"].width = 16
     ws.column_dimensions["C"].width = 48
+    return {"sheet": ws.title, "cells": cells}
 
 
 # ====================================================================== DCF
@@ -525,6 +539,12 @@ def _build_summary(wb, res: DCFResult, dcf: dict):
     ws["A2"] = (f"기준: {d.latest.year}년 사업보고서 {'연결' if d.fs_div == 'CFS' else '별도'}재무제표 "
                 f"(DART) | 추정 {a.years[0]}~{a.years[-1]} | 단위: 백만원")
     ws["A2"].font = NOTE
+    attn = needs_attention(res.issues)
+    if attn:
+        ws["A3"] = (f"⚠ 공시에서 바로 가져오지 못해 가정·기본값·조정을 적용한 값 {len(attn)}건이 결과에 들어 있습니다 → "
+                    f"'Check' 시트에서 먼저 확인하세요 (주황/노랑 셀)")
+        ws["A3"].font = WARN
+        ws["A3"].hyperlink = "#'Check'!A1"
     items = [
         ("주당 내재가치 (원)", f"={D}!B38", NUM, True),
         ("현재 주가 (원)", f"={D}!B39", NUM, False),
@@ -572,3 +592,85 @@ def _build_summary(wb, res: DCFResult, dcf: dict):
         ws.cell(r, 1, s).font = NOTE if s.startswith("색상") else Font()
     ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 18
+
+
+# ====================================================================== 데이터 점검
+DRIVER_ROWS = {"revenue_growth": 5, "ebit_margin": 6, "da_pct": 7, "capex_pct": 8, "nwc_pct": 9}
+
+
+def _highlight_issues(wb, res: DCFResult, hist: dict, assump: dict, dcf: dict) -> list[list[str]]:
+    """점검 항목이 가리키는 셀을 색칠하고 메모를 단다. 항목별 셀 위치 목록을 돌려준다."""
+    out = []
+    first_col = 3
+    for issue in res.issues:
+        fill = ISSUE_FILL[issue.kind]
+        refs = []
+        for t in issue.targets:
+            kind, _, rest = t.partition(":")
+            cells = []
+            if kind == "driver" and rest in DRIVER_ROWS:
+                row = DRIVER_ROWS[rest]
+                cells = [(dcf["sheet"], f"{C(first_col + i)}{row}") for i in range(dcf["n"])]
+            elif kind == "assump" and rest in assump["cells"]:
+                cells = [(assump["sheet"], assump["cells"][rest])]
+            elif kind == "hist":
+                key, _, year = rest.rpartition(":")
+                col = hist["year_col"].get(int(year)) if year.isdigit() else None
+                if col and key in hist["rows"]:
+                    cells = [(hist["sheet"], f"{C(col)}{hist['rows'][key]}")]
+            for sheet, ref in cells:
+                c = wb[sheet][ref]
+                c.fill = fill
+                text = f"[{issue.label}] {issue.item}: {issue.value}\n{issue.reason}"
+                c.comment = Comment(text if c.comment is None else c.comment.text + "\n\n" + text, "DCF")
+            if cells:
+                refs.append(f"{cells[0][0]}!{cells[0][1]}" + (f"~{cells[-1][1]}" if len(cells) > 1 else ""))
+        out.append(refs)
+    return out
+
+
+def _build_check(wb, res: DCFResult, locations: list[list[str]]):
+    ws = wb.create_sheet("Check", 0)
+    issues = res.issues
+    attn = needs_attention(issues)
+    ws["A1"] = f"{res.company.corp_name} — 데이터 점검 (결과를 보기 전에 먼저 확인)"
+    ws["A1"].font = TITLE
+    if attn:
+        ws["A2"] = (f"⚠ 공시에서 바로 가져오지 못해 가정·기본값·조정을 적용한 항목 {len(attn)}건. "
+                    "'위치' 링크의 셀(색칠됨)을 고치면 모델 전체가 다시 계산됩니다.")
+        ws["A2"].font = WARN
+    else:
+        ws["A2"] = "가정으로 대체한 항목이 없습니다." + (" 아래는 보완·0 처리 내역입니다." if issues else "")
+        ws["A2"].font = NOTE
+    head = ["구분", "항목", "사용한 값", "사유 / 출처", "위치 (클릭)"]
+    for j, h in enumerate(head, 1):
+        c = ws.cell(4, j, h)
+        c.font, c.fill = BOLD, HEAD_FILL
+    r = 4
+    for issue, refs in zip(issues, locations):
+        r += 1
+        ws.cell(r, 1, f"{issue.icon} {issue.label}").fill = ISSUE_FILL[issue.kind]
+        ws.cell(r, 2, issue.item)
+        ws.cell(r, 3, issue.value)
+        ws.cell(r, 4, issue.reason).alignment = Alignment(wrap_text=True, vertical="top")
+        if refs:
+            c = ws.cell(r, 5, ", ".join(refs))
+            sheet, _, cell = refs[0].partition("!")
+            c.hyperlink = f"#'{sheet}'!{cell.split('~')[0]}"
+            c.font = Font(color="0563C1", underline="single")
+        if issue.kind in ("assumed", "default", "adjusted"):
+            ws.cell(r, 2).font = BOLD
+        for col in (1, 2, 3, 5):
+            ws.cell(r, col).alignment = Alignment(vertical="top")
+    if not issues:
+        ws.cell(5, 1, "— 없음 —").font = NOTE
+    r += 2
+    ws.cell(r, 1, "구분 설명").font = BOLD
+    for k, (label, icon, desc) in KINDS.items():
+        r += 1
+        ws.cell(r, 1, f"{icon} {label}").fill = ISSUE_FILL[k]
+        ws.cell(r, 2, desc).font = NOTE
+    widths = {"A": 12, "B": 30, "C": 26, "D": 90, "E": 30}
+    for col, wdt in widths.items():
+        ws.column_dimensions[col].width = wdt
+    ws.freeze_panes = "A5"

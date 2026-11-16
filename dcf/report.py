@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import unicodedata
 
+from .issues import KINDS, needs_attention
 from .model import DCFResult
 
 UNIT = 1e8  # 억원
@@ -22,12 +23,33 @@ def _p(x):
     return "—" if x is None else f"{x:.1%}"
 
 
+def format_issues(res: DCFResult) -> list[str]:
+    """데이터 점검 블록 — 공시에서 바로 못 가져와 가정·보완한 값. 리포트 맨 위에 둔다."""
+    issues = res.issues
+    attn = needs_attention(issues)
+    if not issues:
+        return ["[데이터 점검] 모든 항목을 공시에서 추출했습니다 (가정·보완 없음)"]
+    head = (f"[데이터 점검] 먼저 확인할 항목 {len(attn)}건" if attn else "[데이터 점검] 확인 필요 항목 없음")
+    others = len(issues) - len(attn)
+    if others:
+        head += f"  (보완·0 처리 {others}건)"
+    lines = ["┌─ " + head]
+    for i in issues:
+        lines.append(f"│ {i.icon} [{i.label}] {i.item}: {i.value}")
+        lines.append(f"│     └ {i.reason}")
+    legend = "  ".join(f"{KINDS[k][1]} {KINDS[k][0]}" for k in KINDS if any(i.kind == k for i in issues))
+    lines.append("└─ " + legend + "  — 바꾸려면 CLI 옵션(--da, --tax, --beta …)이나 Excel 강조 셀을 수정")
+    return lines
+
+
 def format_report(res: DCFResult) -> str:
     d, a = res.company, res.a
     out = []
     w = out.append
     w(f"■ {d.corp_name} ({d.stock_code})  FCFF DCF  |  기준 {d.latest.year}년 "
       f"{'연결' if d.fs_div == 'CFS' else '별도'}  |  단위: 억원")
+    w("")
+    out.extend(format_issues(res))
     w("")
     w("[과거 실적 — 공시 추출]")
     w(f"{'':14}" + "".join(f"{y.year:>10}" for y in d.years))

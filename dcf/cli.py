@@ -67,6 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--api-key", help="DART API 키 (기본: 환경변수 DART_API_KEY)")
     o.add_argument("--cache-dir", default=".dart_cache")
     o.add_argument("--offline", action="store_true", help="캐시만 사용")
+    o.add_argument("--no-notes", action="store_true",
+                   help="감가상각비가 본문에 없을 때 사업보고서 원문 주석을 조회하지 않음")
     o.add_argument("--excel", help="Excel 파일로 저장 (수식 포함)")
     o.add_argument("--json", help="결과를 JSON 으로 저장")
     return p
@@ -100,7 +102,8 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     client = DartClient(api_key=args.api_key, cache_dir=args.cache_dir, offline=args.offline)
     try:
-        data = load_company(client, args.company, args.year, args.history, args.fs, args.share_class)
+        data = load_company(client, args.company, args.year, args.history, args.fs, args.share_class,
+                            use_notes=not args.no_notes)
         res = run_dcf(data, assumptions_from_args(args))
     except (DartError, ValueError) as e:
         print(f"오류: {e}", file=sys.stderr)
@@ -124,7 +127,8 @@ def result_to_dict(res) -> dict:
                     "corp_code": res.company.corp_code, "base_year": res.company.latest.year,
                     "fs_div": res.company.fs_div},
         "historical": [{"year": y.year, **y.values} for y in res.company.years],
-        "assumptions": {k: getattr(a, k) for k in a.__dataclass_fields__},
+        "data_issues": [i.to_dict() for i in res.issues],
+        "assumptions": {k: getattr(a, k) for k in a.__dataclass_fields__ if k != "issues"},
         "projection": res.rows,
         "valuation": {
             "pv_fcff_sum": res.pv_fcff_sum, "terminal_value": res.terminal_value,
