@@ -1,0 +1,20 @@
+{
+  "projection_years": 5,
+  "revenue_growth": [0.10, 0.08, 0.06, 0.04, 0.03],
+  "ebit_margin": null,
+  "capex_pct_revenue": null,
+  "da_pct_revenue": null,
+  "nwc_pct_revenue": null,
+  "tax_rate": null,
+  "terminal_growth": 0.02,
+  "exit_ev_ebitda": null,
+  "risk_free_rate": 0.030,
+  "equity_risk_premium": 0.060,
+  "beta": 1.1,
+  "size_premium": 0.0,
+  "pre_tax_cost_of_debt": null,
+  "target_debt_weight": null,
+  "share_price": 30000,
+  "mid_year": true,
+  "history_window": 3
+}

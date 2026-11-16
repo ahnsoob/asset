@@ -1,0 +1,24 @@
+{
+ "status": "000",
+ "message": "정상",
+ "list": [
+  {
+   "se": "보통주",
+   "istc_totqy": "50,000,000",
+   "tesstk_co": "2,000,000",
+   "distb_stock_co": "48,000,000"
+  },
+  {
+   "se": "우선주",
+   "istc_totqy": "5,000,000",
+   "tesstk_co": "-",
+   "distb_stock_co": "5,000,000"
+  },
+  {
+   "se": "합계",
+   "istc_totqy": "55,000,000",
+   "tesstk_co": "2,000,000",
+   "distb_stock_co": "53,000,000"
+  }
+ ]
+}
