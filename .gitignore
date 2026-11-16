@@ -6,3 +6,4 @@ __pycache__/
 .env
 !examples/sample_dcf_model.xlsx
 !examples/samsung_biologics_dcf.xlsx
+!examples/doosan_enerbility_dcf.xlsx
