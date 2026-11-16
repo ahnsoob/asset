@@ -84,7 +84,11 @@ class ResolvedAssumptions:
     wacc_override: float | None
     shares: float
     mid_year: bool
+    history_window: int = 3
     notes: list[str] = field(default_factory=list)
+    # 항목 → 산출 근거. "history": 과거 실적에서 그대로 산출(Excel 에서 수식으로 연결),
+    # "market"/"book": 자본구조 가중치 기준. 없으면 직접 입력·기본값·제한(clip) 적용값.
+    derived: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -123,14 +127,20 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
         raise ValueError("매출액이 있는 연도가 없습니다. (금융업 등은 FCFF DCF 에 적합하지 않을 수 있음)")
     recent = hist[-a.history_window:]
     last = data.latest
+    derived: dict[str, str] = {}
+    # 모든 연도에 매출이 있어야 Excel 의 '최근 N년 평균' 열과 같은 연도를 쓰게 된다
+    linkable = len(hist) == len(data.years)
 
-    def avg_ratio(fn, label, default, lo, hi):
+    def avg_ratio(fn, label, default, lo, hi, key):
         vals = [fn(y) for y in recent]
         vals = [v for v in vals if v is not None]
         if not vals:
             notes.append(f"{label}: 공시 데이터 부족 → 기본값 {default:.1%}")
             return default
-        return _clip(mean(vals), lo, hi)
+        m = mean(vals)
+        if linkable and lo <= m <= hi and len(vals) == len(recent):
+            derived[key] = "history"
+        return _clip(m, lo, hi)
 
     # 매출 성장률: 과거 CAGR 에서 영구성장률로 선형 수렴
     growth = _per_year(a.revenue_growth, n)
@@ -145,26 +155,30 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
         g0 = _clip(cagr, -0.10, 0.30)
         if g0 != cagr:
             notes.append(f"과거 매출 CAGR {cagr:.1%} → {g0:.1%} 로 제한")
+        elif span > 0 and linkable:
+            derived["revenue_growth"] = "history"
         gT = a.terminal_growth
         growth = [g0 + (gT - g0) * (i / (n - 1) if n > 1 else 0) for i in range(n)]
 
     margin = _per_year(a.ebit_margin, n) or [avg_ratio(
         lambda y: y.ebit / y.revenue if y.ebit is not None else None,
-        "영업이익률", 0.10, -0.5, 0.6)] * n
+        "영업이익률", 0.10, -0.5, 0.6, "ebit_margin")] * n
     da = _per_year(a.da_pct_revenue, n)
     capex = _per_year(a.capex_pct_revenue, n) or [avg_ratio(
         lambda y: y.capex / y.revenue if y.capex is not None else None,
-        "CAPEX/매출", 0.05, 0.0, 0.6)] * n
+        "CAPEX/매출", 0.05, 0.0, 0.6, "capex_pct")] * n
     if da is None:
         da_vals = [y.da / y.revenue for y in recent if y.da is not None]
         if da_vals:
             da = [_clip(mean(da_vals), 0.0, 0.6)] * n
+            if linkable and len(da_vals) == len(recent) and 0.0 <= mean(da_vals) <= 0.6:
+                derived["da_pct"] = "history"
         else:
             da = list(capex)
             notes.append("감가상각비를 찾지 못해 D&A = CAPEX 로 가정")
     nwc = _per_year(a.nwc_pct_revenue, n) or [avg_ratio(
         lambda y: y.nwc / y.revenue if y.nwc is not None else None,
-        "순운전자본/매출", 0.10, -0.5, 1.0)] * n
+        "순운전자본/매출", 0.10, -0.5, 1.0, "nwc_pct")] * n
 
     if a.tax_rate is not None:
         tax = a.tax_rate
@@ -172,6 +186,8 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
         rates = [y.tax_rate for y in recent if y.tax_rate is not None]
         if rates and 0.05 <= mean(rates) <= 0.40:
             tax = mean(rates)
+            if linkable and len(rates) == len(recent):
+                derived["tax_rate"] = "history"
         else:
             tax = KOREA_TOP_TAX_RATE
             notes.append(f"유효세율 산출 불가/이상치 → 법정 최고세율 {tax:.1%} 사용")
@@ -192,6 +208,7 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
             avg_debt = (last.borrowings + prev.borrowings) / 2
             if avg_debt > 0:
                 kd = _clip(last.get("interest_paid") / avg_debt, a.risk_free_rate, a.risk_free_rate + 0.08)
+                derived["pre_tax_cost_of_debt"] = "history"   # Excel: MAX(rf, MIN(rf+8%, 이자/평균차입금))
         if kd is None:
             kd = a.risk_free_rate + 0.015
             notes.append(f"이자비용/차입금으로 타인자본비용 산출 불가 → 무위험이자율+1.5% = {kd:.2%}")
@@ -203,9 +220,11 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
         if a.share_price:
             equity_mv = a.share_price * shares
             basis = "시가총액"
+            derived["debt_weight"] = "market"
         else:
             equity_mv = last.get("owners_equity") or last.get("total_equity") or 0.0
             basis = "장부가 자본"
+            derived["debt_weight"] = "book"
         wd = debt / (debt + equity_mv) if (debt + equity_mv) > 0 else 0.0
         notes.append(f"자본구조 가중치: {basis} 기준 D/(D+E) = {wd:.1%}")
     wacc = a.wacc_override if a.wacc_override is not None else (1 - wd) * ke + wd * kd * (1 - tax)
@@ -220,7 +239,8 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
         risk_free_rate=a.risk_free_rate, equity_risk_premium=a.equity_risk_premium, beta=a.beta,
         size_premium=a.size_premium, cost_of_equity=ke, pre_tax_cost_of_debt=kd, debt_weight=wd,
         wacc=wacc, wacc_override=a.wacc_override,
-        shares=shares, mid_year=a.mid_year, notes=notes,
+        shares=shares, mid_year=a.mid_year, history_window=a.history_window, notes=notes,
+        derived=derived,
     )
 
 

@@ -184,9 +184,9 @@ def test_excel_export(sample, tmp_path):
     import openpyxl
     res = run_dcf(sample, Assumptions(share_price=30000))
     path = tmp_path / "out.xlsx"
-    export_excel(res, str(path))
+    export_excel(res, str(path), recalc=False)
     wb = openpyxl.load_workbook(path)
-    assert wb.sheetnames == ["DCF", "Assumptions", "Historical", "Sensitivity", "Sources"]
+    assert wb.sheetnames == ["Summary", "Historical", "Assumptions", "DCF", "Sensitivity", "Sources"]
     assert wb["DCF"]["B38"].value == "=B36*1000000/B37"
     assert "wacc" in wb.defined_names
 

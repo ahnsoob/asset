@@ -63,13 +63,28 @@ python -m dcf 삼성전자 --config examples/assumptions.example.json --json res
 연도별 값은 `--growth 10,8,6,4,3` 처럼 쉼표로 넣거나 JSON 설정 파일(`--config`)에 리스트로 넣습니다.
 **베타, 무위험이자율, 시장위험프리미엄, 주가는 공시에 없는 시장 데이터**이므로 직접 넣는 것을 권장합니다.
 
-## Excel 출력
+## Excel 모델 출력 (`--excel`)
 
-- **DCF**: 추정 손익·FCFF·현재가치·EV→주주가치→주당가치. 파란 글씨(성장률, 마진 등)를 바꾸면 자동 재계산됩니다.
-- **Assumptions**: WACC 구성요소, 세율, 순차입금, 주식수 (이름 정의된 셀, 예: `wacc`, `tg`)
-- **Historical**: 공시에서 추출한 과거 실적과 비율
-- **Sensitivity**: WACC × 영구성장률 민감도 (Python 계산 정적 값)
-- **Sources**: 항목별로 매칭된 공시 계정
+계산 과정 전체가 **셀 수식으로 연결된** 모델이 만들어집니다. 예시: [`examples/sample_dcf_model.xlsx`](examples/sample_dcf_model.xlsx)
+
+```
+Historical ──► Assumptions ──► DCF ──► Sensitivity ──► Summary
+(공시 원본 → 파생지표 → 평균/CAGR)  (WACC)   (FCFF → EV → 주당가치)
+```
+
+| 시트 | 내용 |
+|---|---|
+| **Summary** | 주당가치, 상승여력, EV 분해, WACC 등 핵심 결과 + 계산 흐름 설명 |
+| **Historical** | ① DART 공시 원본 값(회색) ② 파생 지표 수식(EBITDA, NWC, 순차입금, 마진, 유효세율, 이자율…) ③ 최근 N년 평균·매출 CAGR |
+| **Assumptions** | CAPM(Rf, β, ERP) → Ke, Kd, 세율, D/(D+E) → WACC, 영구성장률, 현금·차입금·비지배지분, 주식수, 주가 |
+| **DCF** | 연도별 가정 → 매출 → EBIT → NOPAT → +D&A −CAPEX −ΔNWC = FCFF → 할인 → TV → EV → 주주가치 → 주당가치. 행마다 '산출 근거' 설명 |
+| **Sensitivity** | WACC × 영구성장률 주당가치 표 (수식이라 가정 변경 시 함께 갱신) |
+| **Sources** | 각 항목에 매칭된 공시 계정 (재무제표 구분, 계정명, XBRL ID) |
+
+- 글자색: **파란색 = 입력값**, **초록색 = 다른 시트 연결**, 검정 = 계산식. 노란 칸 = 핵심 결과.
+- 공시에서 자동 산출된 가정(성장률, 마진, D&A·CAPEX·NWC 비율, 세율, Kd, 부채비중)은 Historical 시트를 참조하는 수식으로 들어갑니다. 직접 지정한 가정이나 범위 제한(clip)이 걸린 값은 숫자로 들어갑니다.
+- 어느 셀이든 숫자로 덮어쓰면 그 뒤 계산이 전부 다시 됩니다 (예: 2026E 영업이익률만 바꾸기, 베타 바꾸기).
+- LibreOffice 가 설치되어 있으면 계산 결과값도 파일에 저장되어 미리보기에서도 숫자가 보입니다. 없으면 Excel 에서 열 때 계산됩니다.
 
 ## 계산 방식
 

@@ -4,3 +4,4 @@ __pycache__/
 .dart_cache/
 *.xlsx
 .env
+!examples/sample_dcf_model.xlsx
