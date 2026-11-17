@@ -188,7 +188,7 @@ def test_excel_export(sample, tmp_path):
     path = tmp_path / "out.xlsx"
     export_excel(res, str(path), recalc=False)
     wb = openpyxl.load_workbook(path)
-    assert wb.sheetnames == ["Check", "Summary", "Historical", "Assumptions", "DCF", "Sensitivity", "Sources"]
+    assert wb.sheetnames == ["Check", "Summary", "Historical", "Assumptions", "Peer Beta", "DCF", "Sensitivity", "Sources"]
     assert wb["DCF"]["B38"].value == "=B36*1000000/B37"
     assert "wacc" in wb.defined_names
 
@@ -258,3 +258,22 @@ def test_fill_peer_from_dart(sample):
     mc = [Peer("샘플전자", 1.3, company="샘플전자", price=30000)]
     fill_peers_from_dart(client, mc, 2024)
     assert mc[0].equity == 30000 * 53_000_000 and "시가총액" in mc[0].source
+
+
+def test_peer_with_given_unlevered_beta(sample):
+    from dcf.cli import _peer_u
+    peers = [_peer_u("가상A:1.3:1.10"), _peer_u("가상B::0.90"), Peer("가상C", 1.2, de_ratio=0.5)]
+    assert peers[1].beta is None and peers[1].unlevered_beta == 0.90
+    res = run_dcf(sample, Assumptions(peers=peers, share_price=30000))
+    pb = res.a.peer_beta
+    bu_c = 1.2 / (1 + (1 - 0.264) * 0.5)
+    assert [r["beta_u"] for r in pb.rows] == pytest.approx([1.10, 0.90, bu_c])
+    assert pb.unlevered == pytest.approx(sorted([1.10, 0.90, bu_c])[1])
+    de = res.a.debt_weight / (1 - res.a.debt_weight)
+    assert res.a.beta == pytest.approx(pb.unlevered * (1 + (1 - res.a.tax_rate) * de))
+
+
+def test_given_unlevered_skips_dart(tmp_path):
+    client = DartClient(cache_dir=tmp_path, offline=True)       # 캐시 없음 → 조회하면 실패
+    p = Peer("000660", 1.2, company="000660", unlevered_beta=1.0)
+    assert fill_peers_from_dart(client, [p], 2024) == []

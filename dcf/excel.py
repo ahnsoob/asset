@@ -27,6 +27,7 @@ from openpyxl.utils import get_column_letter as C
 from openpyxl.workbook.defined_name import DefinedName
 
 from .accounts import SPECS
+from .beta import PEER_DEFAULT_TAX
 from .issues import KINDS, needs_attention
 from .model import DCFResult
 
@@ -72,8 +73,7 @@ def export_excel(res: DCFResult, path: str, recalc: bool = True) -> None:
     wb = Workbook()
     hist = _build_historical(wb, res)
     assump = _build_assumptions(wb, res, hist)
-    if res.a.peer_beta:
-        _build_peer_beta(wb, res)
+    _build_peer_beta(wb, res)
     dcf = _build_dcf(wb, res, hist)
     _build_sensitivity(wb, res, dcf)
     _build_sources(wb, res)
@@ -273,17 +273,21 @@ def _build_assumptions(wb, res: DCFResult, hist: dict):
     wacc = (a.wacc_override, "input", "직접 입력 (override)") if a.wacc_override is not None else \
         ("=(1-wd)*ke+wd*kd*(1-tax_rate)", "calc", "E/(D+E)×Ke + D/(D+E)×Kd×(1−t)")
 
-    if der.get("beta") == "peers":
-        beta_row = ("beta", "베타 (β, 피어 리레버드)", "=beta_relevered", "link", "0.00",
-                    "Peer Beta 시트: 언레버드 β × (1 + (1 − t) × D/E)")
-    else:
-        beta_row = ("beta", "베타 (β)", a.beta, "input", "0.00",
-                    "직접 입력" + (" (피어 리레버드 β 는 Peer Beta 시트 참고)" if a.peer_beta else ""))
+    use_peers = der.get("beta") == "peers"
+    manual_beta = a.beta if not use_peers else 1.0
+    beta_rows = [
+        ("beta_manual", "베타 직접 입력값", manual_beta, "input", "0.00", "피어 베타를 쓰지 않을 때 적용"),
+        ("use_peer_beta", "피어 리레버드 β 사용 (1 = 예, 0 = 아니오)", 1 if use_peers else 0, "input", "0",
+         "Peer Beta 시트에 피어를 입력하고 1 로 두면 자동 적용"),
+        ("beta", "적용 베타 (β)",
+         "=IF(AND(use_peer_beta=1,ISNUMBER(beta_relevered)),beta_relevered,beta_manual)", "calc", "0.00",
+         "피어 사용 시 Peer Beta 시트의 리레버드 β, 아니면 직접 입력값"),
+    ]
     sections = [
         ("① 자기자본비용 (CAPM)", [
             ("rf", "무위험이자율 (Rf)", a.risk_free_rate, "input", PCT, "국고채 10년 수익률"),
             ("erp", "시장위험프리미엄 (ERP)", a.equity_risk_premium, "input", PCT, ""),
-            beta_row,
+            *beta_rows,
             ("size_premium", "규모 프리미엄", a.size_premium, "input", PCT, ""),
             ("ke", "자기자본비용 (Ke)", "=rf+beta*erp+size_premium", "calc", PCT, "Rf + β × ERP + 규모 프리미엄"),
         ]),
@@ -339,61 +343,96 @@ def _build_assumptions(wb, res: DCFResult, hist: dict):
 
 
 # ====================================================================== Peer Beta
+PEER_ROWS_MIN = 15   # 빈 입력 행 포함 최소 행 수
+
+
 def _build_peer_beta(wb, res: DCFResult):
+    """피어 입력표. 피어명·레버드 β·(언레버드 β 또는 D/E 또는 부채·자본)을 넣으면 베타가 자동 계산된다."""
     pb = res.a.peer_beta
     ws = wb.create_sheet("Peer Beta")
-    ws["A1"] = "피어 베타 언레버링 → 리레버링 (Hamada)"
+    ws["A1"] = "피어 베타 → 대상회사 베타 자동 계산 (Hamada)"
     ws["A1"].font = TITLE
-    ws["A2"] = "β_U = β_L / (1 + (1 − t) × D/E)   →   β_대상 = β_U × (1 + (1 − t_대상) × D/E_대상)"
+    ws["A2"] = ("입력: 피어명 + 언레버드 β (알면)  또는  레버드 β + D/E (또는 부채·자본).  "
+                "언레버드 β 칸이 채워져 있으면 그 값을 우선 사용")
     ws["A2"].font = NOTE
-    heads = ["피어", "레버드 β", "부채 (백만원)", "자본 (백만원)", "D/E", "세율", "언레버드 β", "D/E 출처"]
+    ws["A3"] = "β_U = β_L / (1 + (1 − t) × D/E)   →   대상 β = 대표 β_U × (1 + (1 − t_대상) × D/E_대상)"
+    ws["A3"].font = NOTE
+    heads = ["피어", "레버드 β", "부채 (백만원)", "자본 (백만원)", "D/E", "세율 (빈칸=기본)",
+             "언레버드 β (입력)", "적용 언레버드 β", "출처 / 메모"]
     for j, h in enumerate(heads):
-        c = ws.cell(4, 1 + j, h)
+        c = ws.cell(5, 1 + j, h)
         c.font, c.fill = BOLD, HEAD_FILL
-    r0 = 5
-    for i, p in enumerate(pb.rows):
+        c.alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[5].height = 30
+
+    peers = pb.rows if pb else []
+    n_rows = max(PEER_ROWS_MIN, len(peers) + 5)
+    r0, rl = 6, 6 + n_rows - 1
+    for i in range(n_rows):
         r = r0 + i
-        ws.cell(r, 1, p["name"])
-        ws.cell(r, 2, p["beta_l"]).font = INPUT
-        if p.get("debt") is not None and p.get("equity"):
-            ws.cell(r, 3, _m(p["debt"])).font = INPUT
-            ws.cell(r, 4, _m(p["equity"])).font = INPUT
-            ws.cell(r, 5, f"=C{r}/D{r}")
-        else:
-            ws.cell(r, 5, p["de"]).font = INPUT
-        ws.cell(r, 6, p["tax"]).font = INPUT
-        ws.cell(r, 7, f"=B{r}/(1+(1-F{r})*E{r})")
-        ws.cell(r, 8, p.get("source") or "직접 입력").font = NOTE
-        for col, fmt in ((2, "0.00"), (3, NUM), (4, NUM), (5, PCT), (6, PCT), (7, "0.000")):
+        p = peers[i] if i < len(peers) else None
+        if p:
+            ws.cell(r, 1, p["name"])
+            ws.cell(r, 2, p["beta_l"])
+            if p.get("debt") is not None and p.get("equity"):
+                ws.cell(r, 3, _m(p["debt"]))
+                ws.cell(r, 4, _m(p["equity"]))
+            elif p.get("de") is not None:
+                ws.cell(r, 5, p["de"])
+            if not p.get("given_u") and p.get("tax") is not None:
+                ws.cell(r, 6, p["tax"])
+            if p.get("given_u"):
+                ws.cell(r, 7, p["beta_u"])
+            ws.cell(r, 9, p.get("source") or "")
+        if ws.cell(r, 5).value is None:   # D/E: 부채·자본이 있으면 계산, 직접 숫자를 덮어써도 됨
+            ws.cell(r, 5, f'=IF(AND(ISNUMBER(C{r}),ISNUMBER(D{r})),IF(D{r}<>0,C{r}/D{r},""),"")')
+        ws.cell(r, 8, f'=IF(ISNUMBER(G{r}),G{r},IF(AND(ISNUMBER(B{r}),ISNUMBER(E{r})),'
+                      f'B{r}/(1+(1-IF(ISNUMBER(F{r}),F{r},peer_default_tax))*E{r}),""))')
+        for col in (1, 2, 3, 4, 6, 7):
+            ws.cell(r, col).font = INPUT
+        ws.cell(r, 9).font = NOTE
+        for col, fmt in ((2, "0.00"), (3, NUM), (4, NUM), (5, PCT), (6, PCT), (7, "0.000"), (8, "0.000")):
             ws.cell(r, col).number_format = fmt
-    rl = r0 + len(pb.rows) - 1
+        ws.cell(r, 8).font = BOLD
+
+    rng = f"H{r0}:H{rl}"
+    method = 2 if pb and pb.method == "mean" else 1
+    peer_tax = pb.default_tax if pb else PEER_DEFAULT_TAX
     r = rl + 2
-    rng = f"G{r0}:G{rl}"
     summary = [
-        (None, "언레버드 β 중앙값", f"=MEDIAN({rng})", "0.000", ""),
-        (None, "언레버드 β 평균", f"=AVERAGE({rng})", "0.000", ""),
-        ("beta_unlevered", f"적용 언레버드 β ({'중앙값' if pb.method == 'median' else '평균'})",
-         f"=B{r}" if pb.method == "median" else f"=B{r + 1}", "0.000", "다른 값으로 덮어써도 됨"),
-        ("target_de", "대상회사 D/E", "=wd/(1-wd)", PCT, "Assumptions 의 D/(D+E) 에서 환산"),
-        (None, "대상회사 세율", "=tax_rate", PCT, "Assumptions 법인세율"),
-        ("beta_relevered", "리레버드 β (대상회사)", "=beta_unlevered*(1+(1-tax_rate)*target_de)", "0.000",
-         "β_U × (1 + (1 − t) × D/E)"),
+        ("peer_default_tax", "세율 빈칸 피어에 적용할 세율", peer_tax, PCT,
+         "법인세 최고세율 24% + 지방소득세", True),
+        ("peer_count", "사용된 피어 수", f"=COUNT({rng})", "0", "적용 언레버드 β 가 계산된 행", False),
+        ("peer_bu_median", "언레버드 β 중앙값", f'=IF(peer_count>0,MEDIAN({rng}),"")', "0.000", "", False),
+        ("peer_bu_mean", "언레버드 β 평균", f'=IF(peer_count>0,AVERAGE({rng}),"")', "0.000", "", False),
+        ("peer_method", "집계 방식 (1 = 중앙값, 2 = 평균)", method, "0", "", True),
+        ("beta_unlevered", "대표 언레버드 β", '=IF(peer_method=2,peer_bu_mean,peer_bu_median)', "0.000",
+         "직접 숫자로 덮어써도 됨", False),
+        ("target_de", "대상회사 D/E", "=wd/(1-wd)", PCT, "Assumptions 의 D/(D+E) 에서 환산", False),
+        (None, "대상회사 세율", "=tax_rate", PCT, "Assumptions 법인세율", False),
+        ("beta_relevered", "리레버드 β (대상회사)",
+         '=IF(ISNUMBER(beta_unlevered),beta_unlevered*(1+(1-tax_rate)*target_de),"")', "0.000",
+         "대표 β_U × (1 + (1 − t) × D/E) → Assumptions 적용 베타", False),
+        (None, "현재 적용 베타", "=beta", "0.000", "Assumptions '피어 리레버드 β 사용' 이 1 이면 위 값", False),
     ]
-    for i, (name, label, f, fmt, note) in enumerate(summary):
+    for i, (name, label, f, fmt, note, is_input) in enumerate(summary):
         rr = r + i
         ws.cell(rr, 1, label)
         c = ws.cell(rr, 2, f)
         c.number_format = fmt
+        if is_input:
+            c.font = INPUT
         ws.cell(rr, 3, note).font = NOTE
         if name:
             _name(wb, name, ws.title, f"B{rr}")
         if name == "beta_relevered":
             ws.cell(rr, 1).font = BOLD
             c.font, c.fill, c.border = BOLD, KEY_FILL, DOUBLE
-    ws.column_dimensions["A"].width = 26
-    for col in "BCDEFG":
+    ws.column_dimensions["A"].width = 30
+    for col in "BCDEFGH":
         ws.column_dimensions[col].width = 13
-    ws.column_dimensions["H"].width = 40
+    ws.column_dimensions["I"].width = 40
+    ws.freeze_panes = "B6"
 
 
 # ====================================================================== DCF

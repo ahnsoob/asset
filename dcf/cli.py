@@ -47,6 +47,14 @@ def _peer(s: str) -> Peer:
     return Peer(name=name, beta=beta, de_ratio=de, tax_rate=tax, company=None if de is not None else name)
 
 
+def _peer_u(s: str) -> Peer:
+    """'이름:레버드β:언레버드β'  예) SK하이닉스:1.25:1.08  /  LG전자::0.92 (레버드 β 생략 가능)"""
+    parts = [x.strip() for x in s.split(":")]
+    if len(parts) != 3 or not parts[2]:
+        raise argparse.ArgumentTypeError("형식: 이름:레버드β:언레버드β (레버드β 는 비워도 됨)")
+    return Peer(name=parts[0], beta=float(parts[1]) if parts[1] else None, unlevered_beta=float(parts[2]))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m dcf", description="DART 공시 기반 DCF 밸류에이션")
     p.add_argument("company", help="회사명, 종목코드(6자리) 또는 DART 고유번호(8자리)")
@@ -72,7 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--beta", type=float, help="베타 (기본 1.0)")
     g.add_argument("--peer", type=_peer, action="append",
                    help="피어 베타 (반복 가능): 이름:베타[:D/E[:세율]]. D/E 생략 시 DART 에서 산출")
-    g.add_argument("--peers", help="피어 JSON 파일 (리스트: name, beta, de_ratio | debt+equity | company[, price], tax_rate)")
+    g.add_argument("--peer-u", type=_peer_u, action="append", metavar="이름:레버드β:언레버드β",
+                   help="언레버드 베타를 알고 있는 피어 (반복 가능). D/E 없이 그대로 리레버링에 사용")
+    g.add_argument("--peers", help="피어 JSON 파일 (리스트: name, beta, unlevered_beta | de_ratio | debt+equity | company[, price], tax_rate)")
     g.add_argument("--peer-method", choices=["median", "mean"], help="언레버드 베타 집계 (기본 median)")
     g.add_argument("--peer-tax", type=_pct, help="세율 미지정 피어에 적용할 세율 (기본 26.4%%)")
     g.add_argument("--size-premium", type=_pct, help="규모 프리미엄")
@@ -122,6 +132,8 @@ def assumptions_from_args(args) -> Assumptions:
             peers += json.load(f)
     if args.peer:
         peers += args.peer
+    if args.peer_u:
+        peers += args.peer_u
     cfg["peers"] = peers or None
     return Assumptions.from_dict(cfg)
 
