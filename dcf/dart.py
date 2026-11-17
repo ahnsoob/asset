@@ -7,6 +7,7 @@ API 키 발급: https://opendart.fss.or.kr  →  환경변수 DART_API_KEY 로 �
 """
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import os
@@ -33,6 +34,14 @@ STATUS_NO_DATA = "013"
 
 class DartError(RuntimeError):
     pass
+
+
+def _decode(raw: bytes) -> str:
+    """원문 XML 은 선언이 utf-8 이어도 실제로는 EUC-KR(cp949) 인 경우가 있다 (2022년 이전 공시 등)."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp949", errors="replace")
 
 
 class DartClient:
@@ -149,6 +158,50 @@ class DartClient:
             "reprt_code": reprt_code, "fs_div": fs_div,
         })
         return data.get("list", [])
+
+    def annual_reports(self, corp_code: str, year: int) -> list[str]:
+        """해당 사업연도 사업보고서 접수번호들 (정정 포함, 최근 접수 순)."""
+        data = self.get_json("list", {
+            "corp_code": corp_code, "bgn_de": f"{year + 1}0101", "end_de": f"{year + 2}0630",
+            "pblntf_ty": "A", "page_count": "100",
+        })
+        hits = [r for r in data.get("list", [])
+                if re.search(rf"사업보고서\s*\({year}\.", r.get("report_nm", ""))]
+        hits.sort(key=lambda r: r.get("rcept_no", ""), reverse=True)
+        return [r["rcept_no"] for r in hits]
+
+    def document_xml(self, rcept_no: str) -> str:
+        """공시서류 원문 (document.xml) — 사업보고서 전체(주석 포함) XML 텍스트.
+
+        수 MB 라서 캐시에는 gzip 으로 저장한다.
+        """
+        path = self.cache_dir / f"document__rcept_no-{re.sub(r'[^0-9]', '', rcept_no)}.xml.gz"
+        if path.exists():
+            return gzip.decompress(path.read_bytes()).decode("utf-8", errors="replace")
+        self._require_online(path.name)
+
+        resp = self.session.get(f"{BASE_URL}/document.xml",
+                                params={"crtfc_key": self.api_key, "rcept_no": rcept_no},
+                                timeout=self.timeout * 4)
+        resp.raise_for_status()
+        if not zipfile.is_zipfile(io.BytesIO(resp.content)):
+            try:
+                err = resp.json()
+                msg = f"[{err.get('status')}] {err.get('message')}"
+            except ValueError:
+                msg = repr(resp.content[:200])
+            raise DartError(f"공시 원문 다운로드 실패 (rcept_no={rcept_no}): {msg}")
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            # 본문 XML 이 가장 크다 (첨부 감사보고서 등은 별도 파일)
+            names = sorted((n for n in zf.namelist() if n.lower().endswith(".xml")),
+                           key=lambda n: zf.getinfo(n).file_size, reverse=True)
+            if not names:
+                raise DartError(f"공시 원문에 XML 이 없습니다 (rcept_no={rcept_no})")
+            raw = zf.read(names[0])
+        text = _decode(raw)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(gzip.compress(text.encode("utf-8")))
+        return text
 
     def share_status(self, corp_code: str, year: int, reprt_code: str = "11011") -> list[dict]:
         """주식의 총수 현황 (stockTotqySttus)."""

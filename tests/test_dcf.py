@@ -149,6 +149,8 @@ def test_client_cache_and_ofs_fallback(tmp_path):
     def responder(url, params):
         if "stockTotqySttus" in url:
             return {"status": "000", "list": [{"se": "합계", "istc_totqy": "10", "tesstk_co": "0"}]}
+        if "list.json" in url:                                   # 주석 조회용 공시 목록
+            return {"status": "013", "message": "조회된 데이타가 없습니다."}
         if params["fs_div"] == "CFS":
             return {"status": "013", "message": "조회된 데이타가 없습니다."}
         return {"status": "000", "list": [row("IS", "매출액", "100"), row("IS", "영업이익", "10"),
@@ -186,7 +188,7 @@ def test_excel_export(sample, tmp_path):
     path = tmp_path / "out.xlsx"
     export_excel(res, str(path), recalc=False)
     wb = openpyxl.load_workbook(path)
-    assert wb.sheetnames == ["Summary", "Historical", "Assumptions", "DCF", "Sensitivity", "Sources"]
+    assert wb.sheetnames == ["Check", "Summary", "Historical", "Assumptions", "DCF", "Sensitivity", "Sources"]
     assert wb["DCF"]["B38"].value == "=B36*1000000/B37"
     assert "wacc" in wb.defined_names
 
