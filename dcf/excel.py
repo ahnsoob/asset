@@ -64,6 +64,8 @@ def export_excel(res: DCFResult, path: str, recalc: bool = True) -> None:
     wb = Workbook()
     hist = _build_historical(wb, res)
     _build_assumptions(wb, res, hist)
+    if res.a.peer_beta:
+        _build_peer_beta(wb, res)
     dcf = _build_dcf(wb, res, hist)
     _build_sensitivity(wb, res, dcf)
     _build_sources(wb, res)
@@ -260,11 +262,17 @@ def _build_assumptions(wb, res: DCFResult, hist: dict):
     wacc = (a.wacc_override, "input", "직접 입력 (override)") if a.wacc_override is not None else \
         ("=(1-wd)*ke+wd*kd*(1-tax_rate)", "calc", "E/(D+E)×Ke + D/(D+E)×Kd×(1−t)")
 
+    if der.get("beta") == "peers":
+        beta_row = ("beta", "베타 (β, 피어 리레버드)", "=beta_relevered", "link", "0.00",
+                    "Peer Beta 시트: 언레버드 β × (1 + (1 − t) × D/E)")
+    else:
+        beta_row = ("beta", "베타 (β)", a.beta, "input", "0.00",
+                    "직접 입력" + (" (피어 리레버드 β 는 Peer Beta 시트 참고)" if a.peer_beta else ""))
     sections = [
         ("① 자기자본비용 (CAPM)", [
             ("rf", "무위험이자율 (Rf)", a.risk_free_rate, "input", PCT, "국고채 10년 수익률"),
             ("erp", "시장위험프리미엄 (ERP)", a.equity_risk_premium, "input", PCT, ""),
-            ("beta", "베타 (β)", a.beta, "input", "0.00", "회귀 베타 또는 동종업계 평균"),
+            beta_row,
             ("size_premium", "규모 프리미엄", a.size_premium, "input", PCT, ""),
             ("ke", "자기자본비용 (Ke)", "=rf+beta*erp+size_premium", "calc", PCT, "Rf + β × ERP + 규모 프리미엄"),
         ]),
@@ -314,6 +322,64 @@ def _build_assumptions(wb, res: DCFResult, hist: dict):
     ws.column_dimensions["A"].width = 34
     ws.column_dimensions["B"].width = 16
     ws.column_dimensions["C"].width = 48
+
+
+# ====================================================================== Peer Beta
+def _build_peer_beta(wb, res: DCFResult):
+    pb = res.a.peer_beta
+    ws = wb.create_sheet("Peer Beta")
+    ws["A1"] = "피어 베타 언레버링 → 리레버링 (Hamada)"
+    ws["A1"].font = TITLE
+    ws["A2"] = "β_U = β_L / (1 + (1 − t) × D/E)   →   β_대상 = β_U × (1 + (1 − t_대상) × D/E_대상)"
+    ws["A2"].font = NOTE
+    heads = ["피어", "레버드 β", "부채 (백만원)", "자본 (백만원)", "D/E", "세율", "언레버드 β", "D/E 출처"]
+    for j, h in enumerate(heads):
+        c = ws.cell(4, 1 + j, h)
+        c.font, c.fill = BOLD, HEAD_FILL
+    r0 = 5
+    for i, p in enumerate(pb.rows):
+        r = r0 + i
+        ws.cell(r, 1, p["name"])
+        ws.cell(r, 2, p["beta_l"]).font = INPUT
+        if p.get("debt") is not None and p.get("equity"):
+            ws.cell(r, 3, _m(p["debt"])).font = INPUT
+            ws.cell(r, 4, _m(p["equity"])).font = INPUT
+            ws.cell(r, 5, f"=C{r}/D{r}")
+        else:
+            ws.cell(r, 5, p["de"]).font = INPUT
+        ws.cell(r, 6, p["tax"]).font = INPUT
+        ws.cell(r, 7, f"=B{r}/(1+(1-F{r})*E{r})")
+        ws.cell(r, 8, p.get("source") or "직접 입력").font = NOTE
+        for col, fmt in ((2, "0.00"), (3, NUM), (4, NUM), (5, PCT), (6, PCT), (7, "0.000")):
+            ws.cell(r, col).number_format = fmt
+    rl = r0 + len(pb.rows) - 1
+    r = rl + 2
+    rng = f"G{r0}:G{rl}"
+    summary = [
+        (None, "언레버드 β 중앙값", f"=MEDIAN({rng})", "0.000", ""),
+        (None, "언레버드 β 평균", f"=AVERAGE({rng})", "0.000", ""),
+        ("beta_unlevered", f"적용 언레버드 β ({'중앙값' if pb.method == 'median' else '평균'})",
+         f"=B{r}" if pb.method == "median" else f"=B{r + 1}", "0.000", "다른 값으로 덮어써도 됨"),
+        ("target_de", "대상회사 D/E", "=wd/(1-wd)", PCT, "Assumptions 의 D/(D+E) 에서 환산"),
+        (None, "대상회사 세율", "=tax_rate", PCT, "Assumptions 법인세율"),
+        ("beta_relevered", "리레버드 β (대상회사)", "=beta_unlevered*(1+(1-tax_rate)*target_de)", "0.000",
+         "β_U × (1 + (1 − t) × D/E)"),
+    ]
+    for i, (name, label, f, fmt, note) in enumerate(summary):
+        rr = r + i
+        ws.cell(rr, 1, label)
+        c = ws.cell(rr, 2, f)
+        c.number_format = fmt
+        ws.cell(rr, 3, note).font = NOTE
+        if name:
+            _name(wb, name, ws.title, f"B{rr}")
+        if name == "beta_relevered":
+            ws.cell(rr, 1).font = BOLD
+            c.font, c.fill, c.border = BOLD, KEY_FILL, DOUBLE
+    ws.column_dimensions["A"].width = 26
+    for col in "BCDEFG":
+        ws.column_dimensions[col].width = 13
+    ws.column_dimensions["H"].width = 40
 
 
 # ====================================================================== DCF
@@ -561,6 +627,7 @@ def _build_summary(wb, res: DCFResult, dcf: dict):
     steps = [
         "1. Historical  : DART 공시 원본(회색) → 파생 지표 → 최근 평균·CAGR (수식)",
         "2. Assumptions : CAPM 자기자본비용, 타인자본비용, 세율, D/(D+E) → WACC / 현금·차입금 조정",
+        "   Peer Beta   : (피어 입력 시) 피어 β 언레버링 → 중앙값/평균 → 대상 D/E 로 리레버링 → 베타",
         "3. DCF         : 매출 → EBIT → NOPAT → + D&A − CAPEX − ΔNWC = FCFF → 할인 → TV → EV → 주당가치",
         "4. Sensitivity : WACC × 영구성장률 조합별 주당가치 (수식)",
         "5. Sources     : 각 항목이 어느 공시 계정에서 왔는지",

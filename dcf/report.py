@@ -49,6 +49,17 @@ def format_report(res: DCFResult) -> str:
                             ("FCFF", "fcff", False), ("PV(FCFF)", "pv_fcff", False)]:
         w(_ljust(label, 14) + "".join(f"{(_p(r[key]) if pct else _f(r[key])):>10}" for r in res.rows))
     w("")
+    pb = a.peer_beta
+    if pb:
+        w("[피어 베타 언레버링 → 리레버링]")
+        w(_ljust("피어", 22) + f"{'β(L)':>8}{'D/E':>9}{'세율':>8}{'β(U)':>8}  출처")
+        for r in pb.rows:
+            w(_ljust(r["name"][:20], 22) + f"{r['beta_l']:>8.2f}{r['de']:>9.1%}{r['tax']:>8.1%}"
+              f"{r['beta_u']:>8.3f}  {r['source']}")
+        w(f"  언레버드 베타 ({'중앙값' if pb.method == 'median' else '평균'}) {pb.unlevered:.3f}"
+          f" × (1 + (1 − {pb.target_tax:.1%}) × D/E {pb.target_de:.1%}) = 리레버드 베타 {pb.relevered:.3f}"
+          + ("" if a.derived.get("beta") == "peers" else "  ※ 직접 입력 베타 사용 중"))
+        w("")
     w("[할인율]")
     w(f"  Ke = {a.risk_free_rate:.2%} + {a.beta:.2f} × {a.equity_risk_premium:.2%}"
       + (f" + {a.size_premium:.2%}" if a.size_premium else "") + f" = {a.cost_of_equity:.2%}")

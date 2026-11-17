@@ -54,7 +54,7 @@ python -m dcf 삼성전자 --config examples/assumptions.example.json --json res
 | 매출 성장률 | 과거 매출 CAGR(−10%~30% 로 제한) → 마지막 해에 영구성장률로 선형 수렴 | `--growth` |
 | 영업이익률, D&A/매출, CAPEX/매출, NWC/매출 | 최근 3개년 평균 | `--margin --da --capex --nwc` |
 | 법인세율 | 최근 3개년 유효세율 평균, 이상치면 26.4% (법인세 24% + 지방세) | `--tax` |
-| 자기자본비용 | CAPM: Rf 3.0% + β 1.0 × ERP 6.0% (+ 규모 프리미엄) | `--rf --beta --erp --size-premium` |
+| 자기자본비용 | CAPM: Rf 3.0% + β × ERP 6.0% (+ 규모 프리미엄). β = 직접 입력 > 피어 리레버드 > 1.0 | `--rf --beta --peer --erp --size-premium` |
 | 타인자본비용 | 이자지급액 / 평균 차입금 (Rf ~ Rf+8% 로 제한), 없으면 Rf+1.5% | `--kd` |
 | 자본구조 | 주가 입력 시 시가총액, 아니면 장부가 기준 D/(D+E) | `--debt-weight` |
 | 잔존가치 | 영구성장 2.0% (또는 Exit EV/EBITDA 배수) | `--tg`, `--exit-multiple` |
@@ -62,6 +62,41 @@ python -m dcf 삼성전자 --config examples/assumptions.example.json --json res
 
 연도별 값은 `--growth 10,8,6,4,3` 처럼 쉼표로 넣거나 JSON 설정 파일(`--config`)에 리스트로 넣습니다.
 **베타, 무위험이자율, 시장위험프리미엄, 주가는 공시에 없는 시장 데이터**이므로 직접 넣는 것을 권장합니다.
+
+## 피어 베타 리레버링
+
+유사기업(피어) 베타로 대상회사 베타를 만드는 기능입니다 (Hamada 식).
+
+```
+① 피어별 언레버드 β_U = β_L / (1 + (1 − t) × D/E)
+② 대표 β_U          = 피어 β_U 의 중앙값 (또는 평균, --peer-method mean)
+③ 대상회사 β_L      = 대표 β_U × (1 + (1 − t_대상) × D/E_대상)      → CAPM → Ke → WACC
+```
+
+- **대상회사 D/E**: WACC 에 쓰는 D/(D+E) 를 D/E 로 바꿔 사용 (주가 입력 시 시가, 아니면 장부가, `--debt-weight` 지정 시 목표 자본구조). 베타와 WACC 가중치가 같은 자본구조를 쓰게 됩니다.
+- **대상회사 세율**: 모델 법인세율 (유효세율 평균 또는 `--tax`).
+- **피어 세율**: 피어별로 지정, 없으면 26.4% (`--peer-tax` 로 변경).
+- **피어 D/E**: 직접 입력하거나, 생략하면 **DART 에서 자동 산출**합니다. D = 차입금+사채+리스부채, E = 피어 주가(`price`)를 주면 시가총액, 아니면 장부가 자본.
+- 베타 우선순위: `--beta` 직접 입력 > 피어 리레버드 베타 > 1.0
+
+```bash
+# 명령행: 이름:베타[:D/E[:세율]]  (D/E 생략 → 이름을 회사명/종목코드로 보고 DART 조회)
+python -m dcf 005930 --price 55000 --peer 000660:1.25 --peer LG전자:1.10:45%:24 --peer 삼성전기:1.05
+
+# JSON 파일 (examples/peers.example.json 참고)
+python -m dcf 005930 --price 55000 --peers peers.json --peer-method mean
+```
+
+```json
+[
+  {"name": "피어A", "beta": 1.25, "de_ratio": 0.20, "tax_rate": 0.242},
+  {"name": "피어B", "beta": 0.95, "debt": 300000000000, "equity": 1500000000000},
+  {"name": "피어C", "beta": 1.10, "company": "000660", "price": 180000}
+]
+```
+
+Excel 의 **Peer Beta** 시트에 피어별 D/E·언레버드 β, 중앙값/평균, 리레버드 β 가 수식으로 들어가고, Assumptions 의 베타 셀이 이를 참조합니다. Excel 에서 피어 베타나 주가를 바꾸면 베타 → Ke → WACC → 주당가치까지 다시 계산됩니다.
+피어의 관측 베타(β_L) 자체는 공시에 없으므로 증권사 HTS·블룸버그 등에서 가져와 넣어야 합니다 (통상 주간 2년 또는 월간 5년, KOSPI 대비).
 
 ## Excel 모델 출력 (`--excel`)
 
@@ -77,6 +112,7 @@ Historical ──► Assumptions ──► DCF ──► Sensitivity ──► S
 | **Summary** | 주당가치, 상승여력, EV 분해, WACC 등 핵심 결과 + 계산 흐름 설명 |
 | **Historical** | ① DART 공시 원본 값(회색) ② 파생 지표 수식(EBITDA, NWC, 순차입금, 마진, 유효세율, 이자율…) ③ 최근 N년 평균·매출 CAGR |
 | **Assumptions** | CAPM(Rf, β, ERP) → Ke, Kd, 세율, D/(D+E) → WACC, 영구성장률, 현금·차입금·비지배지분, 주식수, 주가 |
+| **Peer Beta** | (피어 입력 시) 피어별 D/E → 언레버드 β → 중앙값/평균 → 대상 D/E 로 리레버링 |
 | **DCF** | 연도별 가정 → 매출 → EBIT → NOPAT → +D&A −CAPEX −ΔNWC = FCFF → 할인 → TV → EV → 주주가치 → 주당가치. 행마다 '산출 근거' 설명 |
 | **Sensitivity** | WACC × 영구성장률 주당가치 표 (수식이라 가정 변경 시 함께 갱신) |
 | **Sources** | 각 항목에 매칭된 공시 계정 (재무제표 구분, 계정명, XBRL ID) |

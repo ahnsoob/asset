@@ -200,3 +200,59 @@ def test_cli_offline(tmp_path, capsys):
     j = json.loads(out.read_text(encoding="utf-8"))
     assert j["assumptions"]["revenue_growth"] == pytest.approx([0.10, 0.08, 0.06, 0.04, 0.03])
     assert j["assumptions"]["beta"] == 1.2
+
+
+# ------------------------------------------------------------------ peer beta
+from dcf.beta import Peer, fill_peers_from_dart, peer_beta, relever, unlever  # noqa: E402
+from dcf.cli import _peer  # noqa: E402
+
+
+def test_unlever_relever_roundtrip():
+    bu = unlever(1.2, 0.5, 0.25)
+    assert bu == pytest.approx(1.2 / (1 + 0.75 * 0.5))
+    assert relever(bu, 0.5, 0.25) == pytest.approx(1.2)
+
+
+def test_peer_beta_median_and_exclusion():
+    peers = [Peer("A", 1.0, de_ratio=0.0), Peer("B", 1.5, debt=50, equity=100, tax_rate=0.2),
+             Peer("C", 0.8, de_ratio=0.25), Peer("D", 1.1)]            # D: D/E 없음 → 제외
+    res = peer_beta(peers, target_de=0.3, target_tax=0.25, default_tax=0.25)
+    us = sorted([1.0, 1.5 / (1 + 0.8 * 0.5), 0.8 / (1 + 0.75 * 0.25)])
+    assert res.unlevered == pytest.approx(us[1])
+    assert res.relevered == pytest.approx(us[1] * (1 + 0.75 * 0.3))
+    assert len(res.excluded) == 1
+    assert peer_beta(peers, 0.3, 0.25, "mean", 0.25).unlevered == pytest.approx(sum(us) / 3)
+
+
+def test_relevered_beta_flows_into_wacc(sample):
+    peers = [{"name": "P1", "beta": 1.2, "de_ratio": 0.3}, {"name": "P2", "beta": 0.9, "de_ratio": 0.1}]
+    res = run_dcf(sample, Assumptions.from_dict({"peers": peers, "share_price": 30000}))
+    a = res.a
+    de = a.debt_weight / (1 - a.debt_weight)
+    bu = (1.2 / (1 + (1 - 0.264) * 0.3) + 0.9 / (1 + (1 - 0.264) * 0.1)) / 2   # 2개 → 중앙값 = 평균
+    assert a.beta == pytest.approx(bu * (1 + (1 - a.tax_rate) * de))
+    assert a.cost_of_equity == pytest.approx(a.risk_free_rate + a.beta * a.equity_risk_premium)
+    assert a.derived["beta"] == "peers"
+    # 직접 입력 베타가 우선
+    res2 = run_dcf(sample, Assumptions.from_dict({"peers": peers, "beta": 0.7}))
+    assert res2.a.beta == 0.7 and "beta" not in res2.a.derived
+
+
+def test_peer_cli_parse():
+    p = _peer("LG전자:1.1:45%:24")
+    assert (p.name, p.beta, p.de_ratio, p.tax_rate, p.company) == ("LG전자", 1.1, 0.45, 0.24, None)
+    q = _peer("000660:1.25")
+    assert q.de_ratio is None and q.company == "000660"
+
+
+def test_fill_peer_from_dart(sample):
+    client = DartClient(cache_dir=SAMPLE, offline=True)
+    peers = [Peer("999999", 1.3, company="999999"), Peer("없는회사", 1.0, company="없는회사")]
+    notes = fill_peers_from_dart(client, peers, 2024)
+    y = sample.latest
+    assert peers[0].name == "샘플전자"
+    assert peers[0].de == pytest.approx(y.total_debt / y.get("owners_equity"))
+    assert peers[1].de is None and any("없는회사" in n for n in notes)
+    mc = [Peer("샘플전자", 1.3, company="샘플전자", price=30000)]
+    fill_peers_from_dart(client, mc, 2024)
+    assert mc[0].equity == 30000 * 53_000_000 and "시가총액" in mc[0].source

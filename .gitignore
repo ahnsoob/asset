@@ -5,3 +5,4 @@ __pycache__/
 *.xlsx
 .env
 !examples/sample_dcf_model.xlsx
+!examples/sample_dcf_model_peers.xlsx

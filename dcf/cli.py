@@ -12,6 +12,7 @@ import json
 import sys
 from datetime import date
 
+from .beta import Peer, fill_peers_from_dart
 from .dart import DartClient, DartError
 from .excel import export_excel
 from .extract import load_company
@@ -30,6 +31,20 @@ def _pct_list(s: str):
     parts = [p for p in s.split(",") if p.strip()]
     vals = [_pct(p) for p in parts]
     return vals[0] if len(vals) == 1 else vals
+
+
+def _peer(s: str) -> Peer:
+    """'이름:베타[:D/E[:세율]]'  예) SK하이닉스:1.25  /  000660:1.25  /  LG전자:1.1:45%:24
+    D/E 를 생략하면 이름을 회사명/종목코드로 보고 DART 에서 부채·자본을 가져온다."""
+    parts = [x.strip() for x in s.split(":")]
+    if len(parts) < 2:
+        raise argparse.ArgumentTypeError("피어 형식: 이름:베타[:D/E[:세율]]")
+    name, beta = parts[0], float(parts[1])
+    de = None
+    if len(parts) > 2 and parts[2]:
+        de = float(parts[2].rstrip("%")) / (100 if parts[2].endswith("%") else 1)
+    tax = _pct(parts[3]) if len(parts) > 3 and parts[3] else None
+    return Peer(name=name, beta=beta, de_ratio=de, tax_rate=tax, company=None if de is not None else name)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,6 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--rf", type=_pct, help="무위험이자율 (기본 3.0%%)")
     g.add_argument("--erp", type=_pct, help="시장위험프리미엄 (기본 6.0%%)")
     g.add_argument("--beta", type=float, help="베타 (기본 1.0)")
+    g.add_argument("--peer", type=_peer, action="append",
+                   help="피어 베타 (반복 가능): 이름:베타[:D/E[:세율]]. D/E 생략 시 DART 에서 산출")
+    g.add_argument("--peers", help="피어 JSON 파일 (리스트: name, beta, de_ratio | debt+equity | company[, price], tax_rate)")
+    g.add_argument("--peer-method", choices=["median", "mean"], help="언레버드 베타 집계 (기본 median)")
+    g.add_argument("--peer-tax", type=_pct, help="세율 미지정 피어에 적용할 세율 (기본 26.4%%)")
     g.add_argument("--size-premium", type=_pct, help="규모 프리미엄")
     g.add_argument("--kd", type=_pct, help="세전 타인자본비용")
     g.add_argument("--debt-weight", type=_pct, help="목표 D/(D+E)")
@@ -79,6 +99,7 @@ CLI_TO_FIELD = {
     "erp": "equity_risk_premium", "beta": "beta", "size_premium": "size_premium",
     "kd": "pre_tax_cost_of_debt", "debt_weight": "target_debt_weight", "wacc": "wacc_override",
     "price": "share_price", "shares": "shares_outstanding",
+    "peer_method": "peer_beta_method", "peer_tax": "peer_tax_rate",
 }
 
 
@@ -93,6 +114,13 @@ def assumptions_from_args(args) -> Assumptions:
             cfg[fld] = v
     if args.no_mid_year:
         cfg["mid_year"] = False
+    peers = list(cfg.get("peers") or [])
+    if args.peers:
+        with open(args.peers, encoding="utf-8") as f:
+            peers += json.load(f)
+    if args.peer:
+        peers += args.peer
+    cfg["peers"] = peers or None
     return Assumptions.from_dict(cfg)
 
 
@@ -101,7 +129,10 @@ def main(argv=None) -> int:
     client = DartClient(api_key=args.api_key, cache_dir=args.cache_dir, offline=args.offline)
     try:
         data = load_company(client, args.company, args.year, args.history, args.fs, args.share_class)
-        res = run_dcf(data, assumptions_from_args(args))
+        assumptions = assumptions_from_args(args)
+        if assumptions.peers:
+            data.warnings += fill_peers_from_dart(client, assumptions.peers, data.latest.year)
+        res = run_dcf(data, assumptions)
     except (DartError, ValueError) as e:
         print(f"오류: {e}", file=sys.stderr)
         return 1
@@ -124,7 +155,11 @@ def result_to_dict(res) -> dict:
                     "corp_code": res.company.corp_code, "base_year": res.company.latest.year,
                     "fs_div": res.company.fs_div},
         "historical": [{"year": y.year, **y.values} for y in res.company.years],
-        "assumptions": {k: getattr(a, k) for k in a.__dataclass_fields__},
+        "assumptions": {k: getattr(a, k) for k in a.__dataclass_fields__ if k != "peer_beta"},
+        "peer_beta": (None if a.peer_beta is None else {
+            "method": a.peer_beta.method, "unlevered": a.peer_beta.unlevered,
+            "target_de": a.peer_beta.target_de, "target_tax": a.peer_beta.target_tax,
+            "relevered": a.peer_beta.relevered, "peers": a.peer_beta.rows}),
         "projection": res.rows,
         "valuation": {
             "pv_fcff_sum": res.pv_fcff_sum, "terminal_value": res.terminal_value,

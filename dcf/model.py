@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from statistics import mean
 
+from .beta import Peer, PeerBetaResult, peer_beta, PEER_DEFAULT_TAX
 from .extract import CompanyData
 
 KOREA_TOP_TAX_RATE = 0.264   # 법인세 최고세율 24% + 지방소득세 10%
@@ -45,7 +46,10 @@ class Assumptions:
     # WACC
     risk_free_rate: float = 0.030            # 국고채 10년
     equity_risk_premium: float = 0.060
-    beta: float = 1.0
+    beta: float | None = None                # 직접 입력 베타. None 이면 피어 리레버드 베타, 피어도 없으면 1.0
+    peers: list | None = None                # 피어 목록 (Peer 또는 dict: name, beta, de_ratio | debt+equity, tax_rate, company)
+    peer_beta_method: str = "median"         # median | mean
+    peer_tax_rate: float | None = None       # 세율 미지정 피어에 적용 (기본 26.4%)
     size_premium: float = 0.0
     pre_tax_cost_of_debt: float | None = None
     target_debt_weight: float | None = None  # D/(D+E). None 이면 시가(주가 입력 시) 또는 장부가 기준
@@ -59,6 +63,8 @@ class Assumptions:
     @classmethod
     def from_dict(cls, d: dict) -> "Assumptions":
         known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        if known.get("peers"):
+            known["peers"] = [p if isinstance(p, Peer) else Peer.from_dict(p) for p in known["peers"]]
         return cls(**known)
 
 
@@ -89,6 +95,7 @@ class ResolvedAssumptions:
     # 항목 → 산출 근거. "history": 과거 실적에서 그대로 산출(Excel 에서 수식으로 연결),
     # "market"/"book": 자본구조 가중치 기준. 없으면 직접 입력·기본값·제한(clip) 적용값.
     derived: dict[str, str] = field(default_factory=dict)
+    peer_beta: PeerBetaResult | None = None
 
 
 @dataclass
@@ -198,7 +205,6 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
         raise ValueError("유통주식수를 알 수 없습니다. --shares 로 지정하세요.")
 
     # WACC
-    ke = a.risk_free_rate + a.beta * a.equity_risk_premium + a.size_premium
     if a.pre_tax_cost_of_debt is not None:
         kd = a.pre_tax_cost_of_debt
     else:
@@ -227,6 +233,27 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
             derived["debt_weight"] = "book"
         wd = debt / (debt + equity_mv) if (debt + equity_mv) > 0 else 0.0
         notes.append(f"자본구조 가중치: {basis} 기준 D/(D+E) = {wd:.1%}")
+
+    # 베타: 직접 입력 > 피어 리레버드 > 1.0
+    pb = None
+    if a.peers:
+        target_de = wd / (1 - wd) if wd < 1 else float("inf")
+        pb = peer_beta(a.peers, target_de, tax, a.peer_beta_method,
+                       a.peer_tax_rate if a.peer_tax_rate is not None else PEER_DEFAULT_TAX)
+        notes.extend(pb.excluded)
+    if a.beta is not None:
+        beta = a.beta
+        if pb:
+            notes.append(f"직접 입력한 베타 {beta:.2f} 사용 (피어 리레버드 베타 {pb.relevered:.2f} 는 참고용)")
+    elif pb:
+        beta = pb.relevered
+        derived["beta"] = "peers"
+        notes.append(f"피어 {len(pb.rows)}개 언레버드 베타 {pb.method} {pb.unlevered:.3f} → "
+                     f"D/E {pb.target_de:.1%}, 세율 {tax:.1%} 로 리레버링 = {beta:.3f}")
+    else:
+        beta = 1.0
+    ke = a.risk_free_rate + beta * a.equity_risk_premium + a.size_premium
+
     wacc = a.wacc_override if a.wacc_override is not None else (1 - wd) * ke + wd * kd * (1 - tax)
     if wacc <= a.terminal_growth and a.exit_ev_ebitda is None:
         raise ValueError(f"WACC({wacc:.2%}) 가 영구성장률({a.terminal_growth:.2%}) 이하입니다.")
@@ -236,11 +263,11 @@ def resolve_assumptions(data: CompanyData, a: Assumptions) -> ResolvedAssumption
         years=[base_year + i + 1 for i in range(n)],
         revenue_growth=growth, ebit_margin=margin, da_pct=da, capex_pct=capex, nwc_pct=nwc,
         tax_rate=tax, terminal_growth=a.terminal_growth, exit_ev_ebitda=a.exit_ev_ebitda,
-        risk_free_rate=a.risk_free_rate, equity_risk_premium=a.equity_risk_premium, beta=a.beta,
+        risk_free_rate=a.risk_free_rate, equity_risk_premium=a.equity_risk_premium, beta=beta,
         size_premium=a.size_premium, cost_of_equity=ke, pre_tax_cost_of_debt=kd, debt_weight=wd,
         wacc=wacc, wacc_override=a.wacc_override,
         shares=shares, mid_year=a.mid_year, history_window=a.history_window, notes=notes,
-        derived=derived,
+        derived=derived, peer_beta=pb,
     )
 
 

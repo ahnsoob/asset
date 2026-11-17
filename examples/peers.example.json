@@ -1,0 +1,6 @@
+[
+  {"name": "가상피어A", "beta": 1.25, "de_ratio": 0.20, "tax_rate": 0.242},
+  {"name": "가상피어B", "beta": 0.95, "debt": 300000000000, "equity": 1500000000000},
+  {"name": "가상피어C", "beta": 1.10, "de_ratio": 0.45},
+  {"name": "가상피어D", "beta": 1.40, "de_ratio": 0.05, "tax_rate": 0.209}
+]
